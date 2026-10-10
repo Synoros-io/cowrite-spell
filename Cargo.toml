@@ -1,0 +1,8 @@
+[package]
+name = "cowrite-spell"
+version = "0.1.0"
+edition = "2024"
+license = "FSL-1.1-ALv2"
+description = "A small Hunspell-format spellchecker in pure Rust, with the English SCOWL dictionaries"
+repository = "https://github.com/superninjv/cowrite-spell"
+readme = "README.md"
