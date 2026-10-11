@@ -1,11 +1,9 @@
 # cowrite-spell
 
-A small spellchecker in pure Rust, with no dependencies, that reads Hunspell-format dictionaries
-(`.aff` and `.dic`). It contains no GPL code and no GPL data: the checker and its suggestion
+A small, fast, regularly improved spellchecker in pure Rust, with no dependencies, that reads Hunspell-format dictionaries (`.aff` and `.dic`). It contains no GPL code and no GPL data: the checker and its suggestion
 engine are written from scratch, and the only third-party files are the English SCOWL
 dictionaries (the `dictionary-en` and `dictionary-en-gb` npm packages, MIT AND BSD), copied under
-`dictionaries/`. It refuses an `.aff` file that needs anything it does not implement, naming the
-rule it stopped at, rather than quietly checking such a language wrong.
+`dictionaries/`. 
 
 It was written for cowrite, a writing platform, and lives here on its own.
 
@@ -13,8 +11,7 @@ Against public misspelling corpora it puts the intended word first more often th
 does with the same word list, on every corpus measured: 52.5% of the evaluated misspellings
 across six corpora, against 44.1%. It suggests in about a quarter of Hunspell's time and checks
 about four times as fast. It also takes about twice as long to load, and its first suggestion
-takes a further 35 ms to build what suggesting needs. The numbers, the method and the command
-that reproduces them follow.
+takes a further 35 ms to build what suggesting needs.
 
 Contents: [Results](#results), [Methodology](#methodology), [How it works](#how-it-works),
 [The search-structure comparison](#the-search-structure-comparison), [What did not help](#what-did-not-help),
@@ -23,16 +20,14 @@ Contents: [Results](#results), [Methodology](#methodology), [How it works](#how-
 
 ## Results
 
-Three versions of this checker are shown next to Hunspell 1.7.3, all on `dictionaries/en_US`:
+Three versions are shown next to Hunspell 1.7.3, all on `dictionaries/en_US`:
 
 - **original**: the checker as it was at commit `16f8311` (Hunspell-style suggestions);
 - **slips**: an intermediate version that ranks suggestions by a weighted edit cost
   (a "slip" is a common typing or spelling error, which costs less than an unrelated edit);
 - **final**: the current code, which adds a sound-alike layer and the signature search.
 
-Every misspelling is judged against the gold correction its corpus gives, not against Hunspell's
-answer. Measured 2026-10-11 on one Linux workstation. All numbers are printed, including the ones
-that got worse.
+Every misspelling is judged against the gold correction of its source. Measured 2026-10-11 on one Linux workstation, r5 5600x. All numbers are printed.
 
 ### Summed over all six corpora
 
@@ -135,8 +130,7 @@ program that only checks words does not pay the 34.8 ms or the extra memory whil
 
 ### Corpora
 
-Six public misspelling sets, each a list of (misspelling, correct word) pairs. None is included in
-this repository; the harness reads them from a folder you download them into
+Six public misspelling sets [this is only for benchmarking] , a list of (misspelling, correct word) pairs. None is included in this repository.
 ([Reproducing](#reproducing)).
 
 | name | what it is | source |
