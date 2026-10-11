@@ -21,17 +21,21 @@ here on its own.
 - A hyphenated word is right when each part is. Any other word holding a digit ("x86", "2024")
   passes, since the dictionary cannot judge it.
 - A set of the caller's own added words, checked before the dictionary.
-- Suggestions: the `REP` table first, then one-edit slips (two letters swapped, an extra letter, a
-  missing one, a wrong one) and a missing space, ranked by Hunspell's n-gram closeness. At most 5
-  (`MAX_SUGGESTIONS`), in the word's own capitals and kind of apostrophe.
+- Suggestions by Hunspell's method, rebuilt from how it works, not from its code: first the words
+  one slip away, tried in Hunspell's order (capitals, `REP` common misspellings, swapped letters,
+  a neighbouring key from `KEY`, an extra, missing, moved or wrong letter, a doubled pair, a
+  missing space); if the capitals or a common misspelling gave a word it stops there, otherwise
+  the dictionary words sharing the most letter runs with the misspelling follow (Hunspell's n-gram
+  suggester, using `MAXNGRAMSUGS`, `MAXDIFF`, `ONLYMAXDIFF`, `NOSPLITSUGS`), ranked by the same
+  weights. At most 5 (`MAX_SUGGESTIONS`), in the word's own capitals and kind of apostrophe.
 
 ## What it does not
 
 - General compounding (German-style compound words), `FLAG` modes other than single characters,
   affixes with continuation flags, and the other Hunspell directives. These make `parse` return an
   error.
-- Hunspell's n-gram suggestion fallback for words more than one edit away. Such a word gets
-  few or no suggestions.
+- Hunspell's exact order among suggestions that score equally: Hunspell's depends on its hash
+  table's layout, this takes the `.dic`'s order, so the tail of a list can differ.
 - Any language other than English so far; the checker is ready for another whose `.aff` stays
   inside the list above.
 - Splitting text into words: the caller does that and asks about one word at a time.
@@ -56,11 +60,19 @@ The command-line example reads a dictionary folder and words on stdin:
 
 ```
 $ echo "teh the colour 21st" | cargo run --release --example check -- dictionaries/en_US
-teh: the, tech, tee, tea, ten
-colour: color, co lour, col our
+teh: the, eh, tech, tee, tea
+colour: color, co lour, co-lour, col our, col-our
 ```
 
 ## Measured
+
+Suggestions: on 600 common misspellings taken from Wikipedia's list of common misspellings, the
+first suggestion was the same word Hunspell gives 100% of the time (measured 2026-10-10 in
+cowrite, comparing against Hunspell's own output with the same en_US dictionary). Only the first
+suggestion was compared, not the whole list. A word SCOWL does not hold, such as "natively", now
+gets suggestions: naively, negatively, tentatively, alternatively, attentively.
+
+Speed and flagging, earlier measurement:
 
 In cowrite, on a book proposal of 2,148 distinct words: all checked in 20 ms in a debug build, and
 the dictionary loads in about 70 ms. It flagged the same set of words as Hunspell 1.7.3 on that
