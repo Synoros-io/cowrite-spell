@@ -8,37 +8,46 @@
 //! - UTF-8 text (`SET UTF-8`) with single-character flags (no `FLAG` line);
 //! - `PFX`/`SFX` with strip, add and condition, a prefix and a suffix combining when both allow
 //!   it (cross product), no affix carrying flags of its own;
-//! - `ICONV` (the typographic apostrophe read as `'`), `NOSUGGEST`, and for suggestions `TRY`,
-//!   `REP`, `KEY`, `MAXNGRAMSUGS`, `MAXDIFF`, `ONLYMAXDIFF` and `NOSPLITSUGS`;
+//! - `ICONV` (the typographic apostrophe read as `'`), `NOSUGGEST`, and for suggestions `REP`,
+//!   `KEY` and `NOSPLITSUGS`;
 //! - `COMPOUNDRULE`, `COMPOUNDMIN` and `ONLYINCOMPOUND`, which these files use only for ordinals
 //!   ("21st", "112th"), so compounding is only tried on a word that holds a digit;
-//! - `WORDCHARS` is read past: the client splits text into words before it asks.
+//! - read past, as they tune Hunspell's own search, which this one replaces: `TRY`,
+//!   `MAXNGRAMSUGS`, `MAXDIFF`, `ONLYMAXDIFF`; and `WORDCHARS`, as the client splits text into
+//!   words before it asks.
+//!
+//! Every affix is applied once, at load, so the dictionary is held as its word forms (about
+//! 124,000 for English): checking a word is one hash lookup.
 //!
 //! Capitals follow Hunspell: a word the dictionary has in lower case is also right Capitalised
 //! or in ALL CAPS, and one it has capitalised ("Paris") is right in ALL CAPS but not lower case.
 //! A hyphenated word is right when each part is. Any other word holding a digit ("x86", "2024")
 //! is not a word the dictionary can judge, so it passes.
 //!
-//! Suggestions follow Hunspell's suggester (`suggestmgr.cxx` in Hunspell 1.7), rebuilt here from
-//! how it works rather than from its code: first the words one slip away, tried in Hunspell's
-//! order (the word in capitals, common misspellings, letters swapped near or far, a neighbouring
-//! key or a capital, an extra, missing or moved letter, a wrong one, a doubled pair, a missing
-//! space), stopping there when the capitals or a common misspelling give a word; otherwise a few
-//! of the dictionary words sharing the most letter runs with it follow (its n-gram suggester),
-//! ranked by the same weights. Where Hunspell's choice among equal scores depends on its hash
-//! table's layout, this one takes the .dic's order, so the tail of a list can differ.
+//! Suggestions gather candidates three ways and rank them all by one cost:
+//! - near spellings: each form carries a 64-bit signature (which letters it has, a hash of which
+//!   letter pairs, its length), and the forms whose signatures differ from the word's in the
+//!   fewest bits are kept, found by scanning them all (an XOR and a bit count each);
+//! - sound-alikes: each form's sounds-like key (`sound_key`, a small English reduction in the
+//!   spirit of Metaphone), the forms whose key is the word's or one edit from it, found with the
+//!   same signatures over the keys;
+//! - the `.aff`'s listed common misspellings (`REP`) applied where they occur, and the word split
+//!   in two by a missing space.
+//!
+//! The cost (`slip_cost`) is a weighted edit distance: a missing letter, a vowel for a vowel, a
+//! doubled letter, a swap, a neighbouring key and a listed misspelling cost less than an
+//! unrelated letter, and a wrong first letter costs more; a sound-alike costs at most a set
+//! amount. Against the public misspelling corpora this puts the right word first more often than
+//! Hunspell does (the README has the measured table and how to reproduce it).
 
-use std::cmp::Reverse;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 /// The most suggestions one misspelled word offers: 5, what Chromium's spellchecker shows
 /// (`spellcheck::kMaxSuggestions`) and about what Firefox's menu lists; more is a list to read,
 /// not a correction to pick.
 pub const MAX_SUGGESTIONS: usize = 5;
-
-//how many respellings are gathered before the edits stop: 15, Hunspell's MAXSUGGESTION. More
-//are gathered than shown so the n-gram pass sees the same list it does in Hunspell
-const SUGGESTION_POOL: usize = 15;
 
 //the farthest apart two letters may be swapped, or one letter moved, as a slip: 4 places,
 //Hunspell's MAX_CHAR_DISTANCE
@@ -48,112 +57,91 @@ const SLIP_DISTANCE_MAX: usize = 4;
 //three letter rows of a QWERTY keyboard with `|` between the rows
 const DEFAULT_KEYBOARD: &str = "qwertyuiop|asdfghjkl|zxcvbnm";
 
-//the most n-gram respellings added after the slips when the .aff gives no MAXNGRAMSUGS: 4,
-//Hunspell's default
-const DEFAULT_NGRAM_SUGGESTIONS: usize = 4;
+//the costs a candidate is ranked by, in hundredths of an edit. An unrelated wrong, extra or
+//missing letter would be a whole edit; the cheaper slips are the common ones. Tuned by hand on
+//three of the public misspelling corpora (Norvig's first set, Aspell's, Wikipedia's) and checked
+//on three held out (Norvig's second, Birkbeck, Holbrook), which improved alike; the README has
+//the table and the command. The biggest single gain was a missing letter costing about half an
+//edit: leaving a letter out is the commonest misspelling. A split ("to the" for "tothe") costs
+//two edits, so a word within two edits comes first: the corpora's wrong splits ("co lour", "col
+//our") far outnumber the ones they want
+const WRONG_LETTER_COST: u32 = 100;
+const EXTRA_LETTER_COST: u32 = 100;
+const MISSING_LETTER_COST: u32 = 55;
+const NEIGHBOUR_KEY_COST: u32 = 70;
+const VOWEL_COST: u32 = 60;
+const DOUBLED_LETTER_COST: u32 = 40;
+const SWAP_COST: u32 = 50;
+const MOVE_COST: u32 = 80;
+const CONFUSION_COST: u32 = 60;
+const FIRST_LETTER_COST: u32 = 50;
+const SPLIT_COST: u32 = 200;
+//a little, to break ties: a name offered for a word typed in lower case, an added apostrophe
+//("potato's" for "potatos")
+const NAME_COST: u32 = 10;
+const APOSTROPHE_COST: u32 = 5;
+//the letters a vowel-for-vowel slip is cheap between
+const VOWELS: &str = "aeiouy";
 
-//the n-gram suggester keeps the 100 stems most like the word (Hunspell's MAX_ROOTS), grows at
-//most 100 forms from each (MAX_WORDS) and keeps the 200 forms most like it (MAX_GUESS); these
-//bound its work however long the word
-const NGRAM_STEMS: usize = 100;
-const NGRAM_FORMS_PER_STEM: usize = 100;
-const NGRAM_GUESSES: usize = 200;
+//a sound-alike's cost: two edits when its sounds-like key is the word's, one more for each edit
+//between the keys; at two it fills the list where spelling finds little, and seldom takes first
+//place from a near spelling (at 1.5 it took first place from the right word more often than it
+//gave first place to it)
+const SOUND_SAME_COST: u32 = 200;
+const SOUND_EDIT_COST: u32 = 100;
+//a key of fewer than 4 sounds is matched only exactly, as one edit to a short key reaches
+//hundreds of words; and at most 200 forms are taken from the keys
+const SOUND_KEY_FUZZY_LENGTH: usize = 4;
+const SOUND_FORMS_MOST: usize = 200;
+//one edit to a key changes at most 7 bits of its signature: 2 letters, 4 letter pairs and the
+//length class, so the keys within one edit are among those within 7 bits
+const KEY_EDIT_BITS: u32 = 7;
 
-//a stem whose length differs from the word's by more than 4 letters is never compared, as
-//Hunspell skips it to avoid strange suggestions; it also keeps a long nonsense word cheap
-const NGRAM_LENGTH_SLACK: usize = 4;
+//the signature search: a signature within 11 bits of the word's is near (two slips change about
+//that many), and the 1,000 nearest are scored exactly (300 lost about a point of top-5 accuracy
+//on the corpora; scoring them is most of a suggestion's time)
+const SIGNATURE_RADIUS: u32 = 11;
+const SIGNATURE_SCORED: usize = 1000;
 
-//the longest letter run the first n-gram pass compares (3) and the final ranking's two passes
-//(2 weighted, 4 plain), as Hunspell's ngsuggest uses them
-const STEM_RUN_LONGEST: usize = 3;
-const PAIR_RUN_LONGEST: usize = 2;
-const RANK_RUN_LONGEST: usize = 4;
+//the forms index has at least 2 slots per form, so it stays under half full and a lookup probes
+//about one slot; FNV-1a's published 64-bit offset basis and prime hash the forms
+const INDEX_SLOTS_PER_ENTRY: usize = 2;
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-//Hunspell's weights in the final ranking: a guess that is the word in other capitals gets 2000;
-//one over 1000 is excellent and shuts out the rest, one under -100 is poor; a guess sharing too
-//few letter pairs with the word loses 1000; two letters swapped at a distance earn 10
-const SAME_LETTERS_BONUS: i32 = 2000;
-const EXCELLENT_SCORE: i32 = 1000;
-const POOR_SCORE: i32 = -100;
-const FEW_PAIRS_PENALTY: i32 = 1000;
-const DISTANT_SWAP_BONUS: i32 = 10;
+//what a word form may be used for: only judging text (NOSUGGEST), or suggesting too
+const CHECK_ONLY: u8 = 1;
+const SUGGESTIBLE: u8 = 2;
 
-//MAXDIFF, when the .aff gives it, scales how many letter pairs a guess must share: the scale is
-//(10 - MAXDIFF) / 5, so the default of none is a scale of 1
-const MAXDIFF_BASE: f64 = 10.0;
-const MAXDIFF_DIVISOR: f64 = 5.0;
-
-//the keyboard string's row separator
-const KEYBOARD_ROW_BREAK: char = '|';
-
-/// A loaded dictionary: its stems with their flags, and the rules that grow and judge them.
+/// A loaded dictionary: every word form it allows, and what finds and ranks suggestions.
 pub struct Dictionary {
-    //every .dic line as its stem and flags, in the file's order, which the n-gram suggester walks
-    entries: Vec<(String, Vec<char>)>,
-    //each stem with where its entries sit in `entries`; a stem listed twice keeps both
-    stems: HashMap<String, Vec<usize>>,
-    prefixes: Vec<Affix>,
-    suffixes: Vec<Affix>,
+    //every word form, its affixes applied: the forms' text end to end, where each starts (one
+    //more start after the last), what each may be used for, and a hash table of form numbers
+    //plus one (0 an empty slot) to find a form by its text
+    form_text: String,
+    form_starts: Vec<u32>,
+    form_kinds: Vec<u8>,
+    form_index: Vec<u32>,
+    //what finds suggestions, built on the first one asked for, so a dictionary used only to
+    //check words is ready sooner and smaller
+    suggester: OnceLock<Suggester>,
+    //the suffixes' added ends, a split leaving one of which is a fragment ("post ion")
+    suffix_ends: Vec<String>,
     //what a word's characters are replaced by before it is looked up, such as ’ by '
     input_conversions: Vec<(String, String)>,
-    //common misspellings as (wrong, right) pieces, tried first when suggesting
+    //common misspellings as (wrong, right) pieces, and the same as characters for ranking
     replacements: Vec<(String, String)>,
-    //the characters a suggestion may insert or swap in, most common first
-    try_characters: Vec<char>,
+    confusions: Vec<(Vec<char>, Vec<char>)>,
     //the keyboard rows a wrong key is looked for on, `|` between rows
     keyboard: Vec<char>,
-    //how many n-gram respellings may follow the slips; 0 turns that suggester off
-    ngram_suggestions: usize,
-    //MAXDIFF's scale on the letter pairs a guess must share, and ONLYMAXDIFF's "never a poor one"
-    pair_scale: f64,
-    only_max_diff: bool,
     //NOSPLITSUGS: never suggest splitting a word in two
     no_split: bool,
-    nosuggest: Option<char>,
-    only_in_compound: Option<char>,
+    //the stems with capitals inside them ("McKinley"), in ALL CAPS, which is right too
+    mixed_in_capitals: HashSet<String>,
+    //the stems holding a digit, with their flags, which the ordinal compound rules join
+    digit_stems: HashMap<String, Vec<char>>,
     compound_rules: Vec<Vec<RulePart>>,
     compound_min: usize,
-}
-
-//one prefix or suffix entry: the flag a stem carries to take it, whether it combines with an
-//affix of the other side, what it takes off the stem, what it puts on, and what the stem's end
-//(or start, for a prefix) must look like
-struct Affix {
-    flag: char,
-    cross_product: bool,
-    strip: String,
-    add: String,
-    condition: Vec<CharClass>,
-}
-
-//one character position of an affix condition: `.`, `[abc]`, `[^abc]` or a plain character
-enum CharClass {
-    Any,
-    OneOf(Vec<char>),
-    NoneOf(Vec<char>),
-}
-
-//one piece of a compound rule: a flag, and whether it may repeat any number of times (`*`)
-struct RulePart {
-    flag: char,
-    repeats: bool,
-}
-
-//how an n-gram score is docked for a difference in length: only when the other word is longer,
-//or either way
-#[derive(Clone, Copy)]
-enum Lengths {
-    LongerWorse,
-    AnyMismatch,
-}
-
-//how a word is capitalised, which decides the forms it may be found under
-#[derive(Clone, Copy, PartialEq)]
-enum Casing {
-    Lower,
-    Capitalised,
-    AllCaps,
-    Mixed,
 }
 
 impl Dictionary {
@@ -161,24 +149,16 @@ impl Dictionary {
     /// input: the `.aff` and the `.dic` as UTF-8 text
     /// output: the dictionary, or a message naming the first rule this checker does not implement
     pub fn parse(aff: &str, dic: &str) -> Result<Dictionary, String> {
-        let mut dictionary = Dictionary {
-            entries: Vec::new(),
-            stems: HashMap::new(),
-            prefixes: Vec::new(),
-            suffixes: Vec::new(),
-            input_conversions: Vec::new(),
-            replacements: Vec::new(),
-            try_characters: Vec::new(),
-            keyboard: DEFAULT_KEYBOARD.chars().collect(),
-            ngram_suggestions: DEFAULT_NGRAM_SUGGESTIONS,
-            pair_scale: 1.0,
-            only_max_diff: false,
-            no_split: false,
-            nosuggest: None,
-            only_in_compound: None,
-            compound_rules: Vec::new(),
-            compound_min: 1,
-        };
+        let mut prefixes: Vec<Affix> = Vec::new();
+        let mut suffixes: Vec<Affix> = Vec::new();
+        let mut input_conversions = Vec::new();
+        let mut replacements: Vec<(String, String)> = Vec::new();
+        let mut keyboard: Vec<char> = DEFAULT_KEYBOARD.chars().collect();
+        let mut no_split = false;
+        let mut nosuggest: Option<char> = None;
+        let mut only_in_compound: Option<char> = None;
+        let mut compound_rules = Vec::new();
+        let mut compound_min = 1;
         //a flag directive's value as its one character
         let flag = |fields: &[&str]| fields.get(1).and_then(|value| value.chars().next());
         //a table (ICONV, REP, COMPOUNDRULE) opens with a line giving its row count, and the rows
@@ -202,61 +182,420 @@ impl Dictionary {
             match (directive, fields.len()) {
                 (directive, _) if directive.starts_with('#') => {}
                 ("SET", _) if fields.get(1) == Some(&"UTF-8") => {}
-                ("WORDCHARS", _) => {}
-                ("TRY", 2) => dictionary.try_characters = fields[1].chars().collect(),
-                ("KEY", 2) => dictionary.keyboard = fields[1].chars().collect(),
-                ("MAXNGRAMSUGS", 2) => {
-                    dictionary.ngram_suggestions =
-                        fields[1].parse().map_err(|_| line.to_string())?
-                }
-                ("MAXDIFF", 2) => {
-                    let most: f64 = fields[1].parse().map_err(|_| line.to_string())?;
-                    dictionary.pair_scale = (MAXDIFF_BASE - most) / MAXDIFF_DIVISOR;
-                }
-                ("ONLYMAXDIFF", 1) => dictionary.only_max_diff = true,
-                ("NOSPLITSUGS", 1) => dictionary.no_split = true,
-                ("NOSUGGEST", 2) => dictionary.nosuggest = flag(&fields),
-                ("ONLYINCOMPOUND", 2) => dictionary.only_in_compound = flag(&fields),
+                ("WORDCHARS" | "TRY" | "MAXNGRAMSUGS" | "MAXDIFF" | "ONLYMAXDIFF", _) => {}
+                ("KEY", 2) => keyboard = fields[1].chars().collect(),
+                ("NOSPLITSUGS", 1) => no_split = true,
+                ("NOSUGGEST", 2) => nosuggest = flag(&fields),
+                ("ONLYINCOMPOUND", 2) => only_in_compound = flag(&fields),
                 ("COMPOUNDMIN", 2) => {
-                    dictionary.compound_min = fields[1].parse().map_err(|_| line.to_string())?
+                    compound_min = fields[1].parse().map_err(|_| line.to_string())?
                 }
-                ("ICONV", 3) => dictionary
-                    .input_conversions
-                    .push((fields[1].to_string(), fields[2].to_string())),
+                ("ICONV", 3) => {
+                    input_conversions.push((fields[1].to_string(), fields[2].to_string()))
+                }
                 //an underscore in a replacement stands for a space ("alot" to "a lot")
-                ("REP", 3) => dictionary
-                    .replacements
-                    .push((fields[1].to_string(), fields[2].replace('_', " "))),
-                ("COMPOUNDRULE", 2) => dictionary.compound_rules.push(compound_rule(fields[1])?),
+                ("REP", 3) => {
+                    replacements.push((fields[1].to_string(), fields[2].replace('_', " ")))
+                }
+                ("COMPOUNDRULE", 2) => compound_rules.push(compound_rule(fields[1])?),
                 ("PFX" | "SFX", 4) => {}
                 ("PFX" | "SFX", 5) => {
                     let affix = affix(&fields, aff)?;
                     match directive {
-                        "PFX" => dictionary.prefixes.push(affix),
-                        _ => dictionary.suffixes.push(affix),
+                        "PFX" => prefixes.push(affix),
+                        _ => suffixes.push(affix),
                     }
                 }
                 _ => return Err(format!("unsupported .aff rule: {line}")),
             }
         }
 
-        //the first line of a .dic is its count; every other is a stem and its flags
+        //every word form: each stem with every affix its flags allow, as Hunspell's lookup would
+        //accept them (a suffix, a prefix, or both when both combine). The first line of a .dic
+        //is its count, every other a stem and its flags. The forms are written end to end into
+        //one buffer, each as (start, end, kind), rather than a string apiece: there are about
+        //150,000 before duplicates go
+        let mut written = String::new();
+        let mut spans: Vec<(u32, u32, u8)> = Vec::new();
+        let mut suffixed = String::new();
+        let mut mixed_in_capitals = HashSet::new();
+        let mut digit_stems: HashMap<String, Vec<char>> = HashMap::new();
         for line in dic.lines().skip(1) {
             let entry = line.split('\t').next().unwrap_or("").trim();
             if entry.is_empty() {
                 continue;
             }
             let (stem, flags) = entry.split_once('/').unwrap_or((entry, ""));
-            dictionary
-                .stems
-                .entry(stem.to_string())
-                .or_default()
-                .push(dictionary.entries.len());
-            dictionary
-                .entries
-                .push((stem.to_string(), flags.chars().collect()));
+            let flags: Vec<char> = flags.chars().collect();
+            if casing(stem) == Casing::Mixed {
+                mixed_in_capitals.insert(stem.to_uppercase());
+            }
+            if stem.chars().any(|character| character.is_ascii_digit()) {
+                digit_stems
+                    .entry(stem.to_string())
+                    .or_default()
+                    .extend(&flags);
+            }
+            if only_in_compound.is_some_and(|flag| flags.contains(&flag)) {
+                continue;
+            }
+            let kind = match nosuggest.is_some_and(|flag| flags.contains(&flag)) {
+                true => CHECK_ONLY,
+                false => SUGGESTIBLE,
+            };
+            //keep the form just written, or drop it when the affix did not apply
+            let mut close = |written: &mut String, start: usize, made: bool| match made {
+                true => spans.push((start as u32, written.len() as u32, kind)),
+                false => written.truncate(start),
+            };
+            let start = written.len();
+            written.push_str(stem);
+            close(&mut written, start, true);
+            for suffix in suffixes
+                .iter()
+                .filter(|suffix| flags.contains(&suffix.flag))
+            {
+                suffixed.clear();
+                if !suffix.apply_suffix(stem, &mut suffixed) {
+                    continue;
+                }
+                let start = written.len();
+                written.push_str(&suffixed);
+                close(&mut written, start, true);
+                if suffix.cross_product {
+                    for prefix in prefixes
+                        .iter()
+                        .filter(|prefix| prefix.cross_product && flags.contains(&prefix.flag))
+                    {
+                        let start = written.len();
+                        let made = prefix.apply_prefix(&suffixed, &mut written);
+                        close(&mut written, start, made);
+                    }
+                }
+            }
+            for prefix in prefixes
+                .iter()
+                .filter(|prefix| flags.contains(&prefix.flag))
+            {
+                let start = written.len();
+                let made = prefix.apply_prefix(stem, &mut written);
+                close(&mut written, start, made);
+            }
         }
+        //each form once, in the order first written, suggestible if any of the stems it grows
+        //from is: a first hash table over the written forms finds the repeats
+        let text = |span: &(u32, u32, u8)| &written[span.0 as usize..span.1 as usize];
+        let slots = (spans.len() * INDEX_SLOTS_PER_ENTRY)
+            .next_power_of_two()
+            .max(1);
+        let mut first_copy: Vec<u32> = vec![0; slots];
+        let mut unique: Vec<(u32, u32, u8)> = Vec::with_capacity(spans.len());
+        for span in &spans {
+            let mut slot = text_hash(text(span)) & (slots - 1);
+            loop {
+                let entry = first_copy[slot];
+                if entry == 0 {
+                    first_copy[slot] = unique.len() as u32 + 1;
+                    unique.push(*span);
+                    break;
+                }
+                let kept = &mut unique[entry as usize - 1];
+                if text(&*kept) == text(span) {
+                    kept.2 = kept.2.max(span.2);
+                    break;
+                }
+                slot = (slot + 1) & (slots - 1);
+            }
+        }
+        drop((first_copy, spans));
+
+        let mut dictionary = Dictionary {
+            form_text: String::new(),
+            form_starts: Vec::with_capacity(unique.len() + 1),
+            form_kinds: Vec::with_capacity(unique.len()),
+            form_index: Vec::new(),
+            suggester: OnceLock::new(),
+            suffix_ends: suffixes.iter().map(|suffix| suffix.add.clone()).collect(),
+            confusions: replacements
+                .iter()
+                .map(|(wrong, right)| (wrong.chars().collect(), right.chars().collect()))
+                .collect(),
+            input_conversions,
+            replacements,
+            keyboard,
+            no_split,
+            mixed_in_capitals,
+            digit_stems,
+            compound_rules,
+            compound_min,
+        };
+        for span in &unique {
+            let start = dictionary.form_text.len() as u32;
+            dictionary.form_starts.push(start);
+            dictionary.form_text.push_str(text(span));
+            dictionary.form_kinds.push(span.2);
+        }
+        let end = dictionary.form_text.len() as u32;
+        dictionary.form_starts.push(end);
+        dictionary.form_text.shrink_to_fit();
+        drop((unique, written));
+
+        //the hash table that finds a form by its text
+        let slots = (dictionary.form_kinds.len() * INDEX_SLOTS_PER_ENTRY)
+            .next_power_of_two()
+            .max(1);
+        dictionary.form_index = vec![0; slots];
+        for id in 0..dictionary.form_kinds.len() {
+            let mut slot = text_hash(dictionary.form(id)) & (slots - 1);
+            while dictionary.form_index[slot] != 0 {
+                slot = (slot + 1) & (slots - 1);
+            }
+            dictionary.form_index[slot] = id as u32 + 1;
+        }
+
         Ok(dictionary)
+    }
+
+    //one form's text, by its number
+    fn form(&self, id: usize) -> &str {
+        &self.form_text[self.form_starts[id] as usize..self.form_starts[id + 1] as usize]
+    }
+
+    //what one exact form may be used for: 0 when the dictionary does not allow it
+    fn kind_of(&self, word: &str) -> u8 {
+        let mask = self.form_index.len() - 1;
+        let mut slot = text_hash(word) & mask;
+        loop {
+            let entry = self.form_index[slot];
+            if entry == 0 {
+                return 0;
+            }
+            if self.form(entry as usize - 1) == word {
+                return self.form_kinds[entry as usize - 1];
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    //the suggester: the suggestible forms, their signatures, and their sounds-like keys grouped
+    fn suggester(&self) -> &Suggester {
+        self.suggester.get_or_init(|| {
+            let mut suggester = Suggester::default();
+            //the suggestible forms' signatures, and their sounds-like keys: written end to end,
+            //each as (its hash, start, end, position among the suggestible)
+            let mut signatures = Vec::new();
+            let mut keys_written: Vec<u8> = Vec::new();
+            let mut keyed: Vec<(usize, u32, u32, u32)> = Vec::new();
+            let mut lower: Vec<char> = Vec::new();
+            for id in 0..self.form_kinds.len() {
+                if self.form_kinds[id] != SUGGESTIBLE {
+                    continue;
+                }
+                lower.clear();
+                lower.extend(self.form(id).chars().flat_map(char::to_lowercase));
+                let start = keys_written.len() as u32;
+                keys_written.extend(sound_key(&lower));
+                let position = suggester.suggestible.len() as u32;
+                let end = keys_written.len() as u32;
+                let hash = text_hash_bytes(&keys_written[start as usize..]);
+                keyed.push((hash, start, end, position));
+                signatures.push(signature(&lower));
+                suggester.suggestible.push(id as u32);
+            }
+            suggester.spellings = Signatures(signatures);
+            //grouped by sorting on each key's hash, which brings equal keys together without
+            //comparing their text
+            let key =
+                |entry: &(usize, u32, u32, u32)| &keys_written[entry.1 as usize..entry.2 as usize];
+            keyed.sort_unstable_by_key(|entry| (entry.0, entry.3));
+            let mut key_signatures = Vec::new();
+            for (at, entry) in keyed.iter().enumerate() {
+                if at == 0 || key(&keyed[at - 1]) != key(entry) {
+                    suggester.key_starts.push(suggester.key_text.len() as u32);
+                    suggester
+                        .key_text
+                        .extend(key(entry).iter().map(|&sound| sound as char));
+                    suggester
+                        .key_form_starts
+                        .push(suggester.key_forms.len() as u32);
+                    key_signatures.push(signature(key(entry)));
+                }
+                suggester.key_forms.push(entry.3);
+            }
+            suggester.key_starts.push(suggester.key_text.len() as u32);
+            suggester
+                .key_form_starts
+                .push(suggester.key_forms.len() as u32);
+            suggester.sounds = Signatures(key_signatures);
+            suggester
+        })
+    }
+
+    //the respellings of one word with no hyphen, cheapest first, put back into the word's
+    //capitals: near spellings, sound-alikes, listed misspellings and splits, ranked together
+    fn respell(&self, word: &str, personal: &HashSet<String>) -> Vec<String> {
+        let casing = casing(word);
+        let as_typed: Vec<char> = word.chars().collect();
+        let lower: Vec<char> = word.to_lowercase().chars().collect();
+        //a word holding a digit is respelled only as an ordinal, its ending changed
+        if lower.iter().any(|character| character.is_ascii_digit()) {
+            let digits = word.trim_end_matches(|character: char| character.is_alphabetic());
+            return ["st", "nd", "rd", "th"]
+                .iter()
+                .map(|ending| format!("{digits}{ending}"))
+                .filter(|ordinal| ordinal != word && self.compound(ordinal))
+                .collect();
+        }
+        let suggester = self.suggester();
+        //every candidate, and what it costs as a sound-alike when it is one
+        let mut candidates: Vec<Cow<str>> = Vec::new();
+        let mut sound_costs: HashMap<&str, u32> = HashMap::new();
+
+        //near spellings
+        let near = suggester
+            .spellings
+            .near(signature(&lower), SIGNATURE_RADIUS, SIGNATURE_SCORED);
+        for position in near {
+            let form = self.form(suggester.suggestible[position as usize] as usize);
+            candidates.push(Cow::Borrowed(form));
+        }
+
+        //sound-alikes: the forms whose sounds-like key is the word's, or one edit from it when
+        //the key is long enough for one edit to mean something
+        let typed_key = sound_key(&lower);
+        let radius = u32::from(typed_key.len() >= SOUND_KEY_FUZZY_LENGTH);
+        let farthest = if radius == 0 { 0 } else { KEY_EDIT_BITS };
+        let mut keys: Vec<(u32, usize)> = suggester
+            .sounds
+            .near(signature(&typed_key), farthest, usize::MAX)
+            .into_iter()
+            .filter_map(|at| {
+                let distance = edit_distance(suggester.key(at as usize), &typed_key);
+                (distance <= radius).then_some((distance, at as usize))
+            })
+            .collect();
+        keys.sort_unstable();
+        let mut taken = 0;
+        for (distance, at) in keys {
+            let range =
+                suggester.key_form_starts[at] as usize..suggester.key_form_starts[at + 1] as usize;
+            for &position in &suggester.key_forms[range] {
+                if taken == SOUND_FORMS_MOST {
+                    break;
+                }
+                taken += 1;
+                let form = self.form(suggester.suggestible[position as usize] as usize);
+                let cost = SOUND_SAME_COST + distance * SOUND_EDIT_COST;
+                let known = sound_costs.entry(form).or_insert(cost);
+                *known = (*known).min(cost);
+                candidates.push(Cow::Borrowed(form));
+            }
+        }
+
+        //the listed common misspellings, at every place each occurs, overlaps included; one
+        //holding a space ("alot" to "a lot") is good when each of its words is
+        let text: String = lower.iter().collect();
+        for (wrong, right) in &self.replacements {
+            let mut from = 0;
+            while let Some(offset) = text[from..].find(wrong.as_str()) {
+                let at = from + offset;
+                let replaced = format!("{}{right}{}", &text[..at], &text[at + wrong.len()..]);
+                if replaced
+                    .split(' ')
+                    .all(|part| self.suggestible_word(part, personal))
+                {
+                    candidates.push(Cow::Owned(replaced));
+                }
+                from = at + wrong.chars().next().map_or(1, char::len_utf8);
+            }
+        }
+
+        //a missing space, at every place where both halves are words. A half of one letter, or
+        //a second half that is one of the language's own suffixes ("post ion", "admit ed"), is
+        //a fragment of the word rather than a word, and is not offered
+        if !self.no_split && lower.len() >= 4 {
+            for at in 2..lower.len() - 1 {
+                let first: String = lower[..at].iter().collect();
+                let second: String = lower[at..].iter().collect();
+                if self.suggestible_word(&first, personal)
+                    && self.suggestible_word(&second, personal)
+                    && !self.suffix_ends.contains(&second)
+                {
+                    candidates.push(Cow::Owned(format!("{first} {second}")));
+                }
+            }
+        }
+
+        //the person's own words are candidates like any other
+        candidates.extend(personal.iter().map(|word| Cow::Borrowed(word.as_str())));
+
+        //each once, ranked by its cost; equal costs keep the order found. The listed
+        //misspellings in the word and the cost table are worked out once, not per candidate
+        let confusions_at = self.confusions_in(&lower);
+        let mut table: Vec<u32> = Vec::new();
+        let mut candidate_lower: Vec<char> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut ranked: Vec<(u32, &str)> = Vec::new();
+        for candidate in &candidates {
+            if !seen.insert(candidate) {
+                continue;
+            }
+            candidate_lower.clear();
+            candidate_lower.extend(candidate.chars().flat_map(char::to_lowercase));
+            let mut cost = self.slip_cost(&lower, &confusions_at, &candidate_lower, &mut table);
+            if let Some(&sound) = sound_costs.get(candidate.as_ref()) {
+                cost = cost.min(sound);
+            }
+            ranked.push((cost + ranking_extra(&as_typed, candidate), candidate));
+        }
+        ranked.sort_by_key(|(cost, _)| *cost);
+        ranked
+            .into_iter()
+            .map(|(_, respelling)| match casing {
+                Casing::Capitalised | Casing::AllCaps => recase(respelling, casing),
+                Casing::Lower | Casing::Mixed => respelling.to_string(),
+            })
+            .collect()
+    }
+
+    //whether a word may be suggested exactly as written: the person's word, or a form not
+    //marked never-to-suggest
+    fn suggestible_word(&self, word: &str, personal: &HashSet<String>) -> bool {
+        !word.is_empty() && (personal.contains(word) || self.kind_of(word) == SUGGESTIBLE)
+    }
+
+    //check a converted word; `nosuggest` says whether forms marked never-to-suggest count, which
+    //they do when judging the text and do not when choosing what to suggest
+    fn check_converted(&self, word: &str, personal: &HashSet<String>, nosuggest: bool) -> bool {
+        if word.is_empty() {
+            return false;
+        }
+        //a hyphenated word is right when each of its parts is
+        if word.contains('-') {
+            return word
+                .split('-')
+                .filter(|part| !part.is_empty())
+                .all(|part| self.check_converted(part, personal, nosuggest));
+        }
+        //a word holding a digit is judged only when it is shaped like an ordinal
+        if word.chars().any(|character| character.is_ascii_digit()) {
+            let digits = word.trim_end_matches(|character: char| character.is_alphabetic());
+            let ordinal = digits.len() < word.len()
+                && digits.chars().all(|character| character.is_ascii_digit());
+            return !ordinal || self.compound(&word.to_lowercase());
+        }
+        //the forms a word may be found under, by its capitals
+        let lower = word.to_lowercase();
+        let forms: Vec<String> = match casing(word) {
+            Casing::Lower | Casing::Mixed => vec![word.to_string()],
+            Casing::Capitalised => vec![word.to_string(), lower],
+            Casing::AllCaps => vec![word.to_string(), recase(&lower, Casing::Capitalised), lower],
+        };
+        let least = if nosuggest { CHECK_ONLY } else { SUGGESTIBLE };
+        forms
+            .iter()
+            .any(|form| personal.contains(form) || self.kind_of(form) >= least)
+            || self.mixed_in_capitals.contains(word)
     }
 
     /// Whether a word is spelled right.
@@ -313,552 +652,127 @@ impl Dictionary {
             .collect()
     }
 
-    //the respellings of one word with no hyphen, as Hunspell orders them: the slips first, tried
-    //on the word as typed and then in the capitals the dictionary may list it under, then the
-    //n-gram guesses unless the slips found the answer, all put back into the word's capitals
-    fn respell(&self, word: &str, personal: &HashSet<String>) -> Vec<String> {
-        let casing = casing(word);
-        let as_typed: Vec<char> = word.chars().collect();
-        let lower: Vec<char> = word.to_lowercase().chars().collect();
-        let mut found: Vec<String> = Vec::new();
-        //only the last pass decides whether the slips found the answer, as in Hunspell
-        let answered = match casing {
-            Casing::Lower | Casing::Mixed => self.slips(&as_typed, personal, &mut found),
-            Casing::Capitalised => {
-                self.slips(&as_typed, personal, &mut found);
-                self.slips(&lower, personal, &mut found)
-            }
-            Casing::AllCaps => {
-                self.slips(&lower, personal, &mut found);
-                let capitalised: Vec<char> = recase(&word.to_lowercase(), Casing::Capitalised)
-                    .chars()
-                    .collect();
-                self.slips(&capitalised, personal, &mut found)
-            }
-        };
-        if !answered && self.ngram_suggestions > 0 {
-            //a lower-case word is not offered names, which the dictionary has capitalised
-            match casing {
-                Casing::Lower => self.ngram_guesses(&as_typed, true, personal, &mut found),
-                _ => self.ngram_guesses(&lower, false, personal, &mut found),
-            }
-        }
-        match casing {
-            Casing::Capitalised | Casing::AllCaps => found
-                .iter()
-                .map(|respelling| recase(respelling, casing))
-                .collect(),
-            Casing::Lower | Casing::Mixed => found,
-        }
-    }
-
-    //add the words one slip away from a word to `found`, in the order Hunspell tries the slips
-    //and each in the order it walks the word
-    //input: the word as characters, the person's words, the respellings so far
-    //output: whether the word in capitals or a listed common misspelling (REP) is a word, which
-    //  Hunspell takes as the answer: the other slips and the n-gram guesses are then skipped
-    fn slips(&self, word: &[char], personal: &HashSet<String>, found: &mut Vec<String>) -> bool {
-        let length = word.len();
-        let text: String = word.iter().collect();
-        let mut candidate: Vec<char> = word.to_vec();
-
-        //the word in capitals, for an abbreviation typed in lower case ("html")
-        let before_capitals = found.len();
-        self.offer(&text.to_uppercase(), personal, found);
-        let mut answered = found.len() > before_capitals;
-
-        //the listed common misspellings, at every place each one occurs, overlaps included
-        for (wrong, right) in &self.replacements {
-            let mut from = 0;
-            while let Some(offset) = text[from..].find(wrong.as_str()) {
-                let at = from + offset;
-                let replaced = format!("{}{right}{}", &text[..at], &text[at + wrong.len()..]);
-                let before = found.len();
-                self.offer(&replaced, personal, found);
-                answered |= found.len() > before;
-                //a replacement holding a space ("alot" to "a lot") is good when the words
-                //before each space are words and what follows is one
-                let mut previous = 0;
-                for (space, _) in replaced.match_indices(' ') {
-                    if self.suggestible(&replaced[previous..space], personal) {
-                        let before = found.len();
-                        self.offer(&replaced[space + 1..], personal, found);
-                        if found.len() > before {
-                            found.pop();
-                            found.push(replaced.clone());
-                        }
-                    }
-                    previous = space + 1;
-                }
-                from = at + wrong.chars().next().map_or(1, char::len_utf8);
-            }
-        }
-        //the word in capitals, or a listed misspelling that is a word as it stands, is taken as
-        //the answer, and Hunspell tries nothing else; a listed one split by a space ("a lot") is
-        //not
-        if answered {
-            return true;
-        }
-
-        //two neighbouring letters swapped, and in a word of four or five letters two pairs of
-        //them ("ahev" to "have", "owudl" to "would")
-        for at in 0..length.saturating_sub(1) {
-            candidate.swap(at, at + 1);
-            self.offer_characters(&candidate, personal, found);
-            candidate.swap(at, at + 1);
-        }
-        if length == 4 || length == 5 {
-            candidate[0] = word[1];
-            candidate[1] = word[0];
-            candidate[2] = word[2];
-            candidate[length - 2] = word[length - 1];
-            candidate[length - 1] = word[length - 2];
-            self.offer_characters(&candidate, personal, found);
-            if length == 5 {
-                candidate[0] = word[0];
-                candidate[1] = word[2];
-                candidate[2] = word[1];
-                self.offer_characters(&candidate, personal, found);
-            }
-            candidate.copy_from_slice(word);
-        }
-
-        //two letters a little further apart swapped
-        for first in 0..length {
-            for second in 0..length {
-                let distance = first.abs_diff(second);
-                if distance > 1 && distance <= SLIP_DISTANCE_MAX {
-                    candidate.swap(first, second);
-                    self.offer_characters(&candidate, personal, found);
-                    candidate.swap(first, second);
-                }
-            }
-        }
-
-        //a letter that should be a capital, or a key next to the right one on the keyboard
-        for at in 0..length {
-            let original = word[at];
-            let mut upper = original.to_uppercase();
-            if let (Some(capital), None) = (upper.next(), upper.next())
-                && capital != original
-            {
-                candidate[at] = capital;
-                self.offer_characters(&candidate, personal, found);
-            }
-            for (place, _) in self
-                .keyboard
-                .iter()
-                .enumerate()
-                .filter(|(_, key)| **key == original)
-            {
-                let left = place.checked_sub(1).map(|left| self.keyboard[left]);
-                let right = self.keyboard.get(place + 1).copied();
-                for neighbour in [left, right].into_iter().flatten() {
-                    if neighbour != KEYBOARD_ROW_BREAK {
-                        candidate[at] = neighbour;
-                        self.offer_characters(&candidate, personal, found);
-                    }
-                }
-            }
-            candidate[at] = original;
-        }
-
-        //an extra letter, taken out from the end of the word backwards
-        if length >= 2 {
-            for at in (0..length).rev() {
-                let removed = candidate.remove(at);
-                self.offer_characters(&candidate, personal, found);
-                candidate.insert(at, removed);
-            }
-        }
-
-        //a missing letter: each TRY character put in at every place, from the end backwards
-        for &character in &self.try_characters {
-            for at in (0..=length).rev() {
-                candidate.insert(at, character);
-                self.offer_characters(&candidate, personal, found);
-                candidate.remove(at);
-            }
-        }
-
-        //a letter typed two or three places early, moved forward; then one typed late, moved
-        //back (a move of one place is a swap, tried above)
-        for from in 0..length {
-            for to in from + 1..length.min(from + SLIP_DISTANCE_MAX) {
-                candidate.swap(to, to - 1);
-                if to - from >= 2 {
-                    self.offer_characters(&candidate, personal, found);
-                }
-            }
-            candidate.copy_from_slice(word);
-        }
-        for from in (1..length).rev() {
-            for to in (from.saturating_sub(SLIP_DISTANCE_MAX - 1)..from).rev() {
-                candidate.swap(to, to + 1);
-                if from - to >= 2 {
-                    self.offer_characters(&candidate, personal, found);
-                }
-            }
-            candidate.copy_from_slice(word);
-        }
-
-        //a wrong letter: each TRY character in place of each letter, from the end backwards
-        for &character in &self.try_characters {
-            for at in (0..length).rev() {
-                if word[at] == character {
-                    continue;
-                }
-                candidate[at] = character;
-                self.offer_characters(&candidate, personal, found);
-                candidate[at] = word[at];
-            }
-        }
-
-        //a pair of letters typed twice ("vacacation" to "vacation"): the same letter two
-        //places back, three times in a row or twice from the fifth letter on
-        if length >= 5 {
-            let mut repeats = 0;
-            for at in 2..length {
-                if word[at] != word[at - 2] {
-                    repeats = 0;
-                    continue;
-                }
-                repeats += 1;
-                if repeats == 3 || (repeats == 2 && at >= 4) {
-                    let shorter: Vec<char> = word[..at - 1]
-                        .iter()
-                        .chain(&word[at + 1..])
-                        .copied()
-                        .collect();
-                    self.offer_characters(&shorter, personal, found);
-                    repeats = 0;
-                }
-            }
-        }
-
-        //a missing space, at every place where both halves are words; with a hyphen too when
-        //neither half is a single letter and the language joins words that way (its TRY has
-        //`a` or `-`, as Hunspell judges it)
-        let joins_with_hyphen =
-            self.try_characters.contains(&'a') || self.try_characters.contains(&'-');
-        if !self.no_split && length >= 3 {
-            for at in 1..length {
-                let first: String = word[..at].iter().collect();
-                let second: String = word[at..].iter().collect();
-                if !self.suggestible(&second, personal) || !self.suggestible(&first, personal) {
-                    continue;
-                }
-                let mut pairs = vec![format!("{first} {second}")];
-                if joins_with_hyphen && at > 1 && length - at > 1 {
-                    pairs.push(format!("{first}-{second}"));
-                }
-                for pair in pairs {
-                    if found.len() < SUGGESTION_POOL && !found.contains(&pair) {
-                        found.push(pair);
-                    }
-                }
-            }
-        }
-        answered
-    }
-
-    //add to `found` the dictionary words most like a word by their shared letter runs, as
-    //Hunspell's n-gram suggester picks them
-    //input: the word as characters (lower case unless it mixes capitals), whether names are kept
-    //  out, the person's words, the respellings so far
-    //output: up to the .aff's MAXNGRAMSUGS more respellings in `found`
-    fn ngram_guesses(
+    //how costly a slip it is to type `candidate` as `typed`, both in lower case, in hundredths of
+    //an edit: a weighted edit distance where a wrong key next to the right one, one vowel for
+    //another, a doubled or undoubled letter, two letters swapped and a listed common misspelling
+    //(REP) each cost less than an unrelated letter, and getting the first letter wrong costs more
+    //input: the typed word, the listed misspellings found in it (`confusions_in`), the candidate,
+    //and a buffer to reuse for the table
+    fn slip_cost(
         &self,
-        word: &[char],
-        lower_case_only: bool,
-        personal: &HashSet<String>,
-        found: &mut Vec<String>,
-    ) {
-        let length = word.len();
-        //every stem, then the person's words as stems with no flags
-        let no_flags: Vec<char> = Vec::new();
-        let stems = self
-            .entries
-            .iter()
-            .map(|(stem, flags)| (stem.as_str(), flags))
-            .chain(personal.iter().map(|word| (word.as_str(), &no_flags)));
-
-        //first, the stems most like the word, compared in lower case; a slot holds the stem and
-        //its score, the empty slots starting below anything real
-        let mut best_stems: Vec<(i32, Option<(&str, &Vec<char>)>)> = (0..NGRAM_STEMS)
-            .map(|slot| (slot_floor(slot), None))
-            .collect();
-        let mut lowest = NGRAM_STEMS - 1;
-        //the flags that keep a stem out, and two buffers reused across the stems, since this
-        //loop runs over the whole dictionary
-        let never: Vec<char> = [self.nosuggest, self.only_in_compound]
-            .into_iter()
-            .flatten()
-            .collect();
-        let mut stem_characters: Vec<char> = Vec::new();
-        let mut lowered: Vec<char> = Vec::new();
-        for (stem, flags) in stems {
-            if never.iter().any(|flag| flags.contains(flag)) {
-                continue;
-            }
-            stem_characters.clear();
-            stem_characters.extend(stem.chars());
-            if stem_characters.len().abs_diff(length) > NGRAM_LENGTH_SLACK {
-                continue;
-            }
-            let capitalised = stem_characters
-                .iter()
-                .any(|character| character.is_uppercase());
-            if lower_case_only
-                && stem_characters
-                    .first()
-                    .is_some_and(|first| first.is_uppercase())
-            {
-                continue;
-            }
-            //most stems are lower case already and are compared as they are
-            let compared: &[char] = match capitalised {
-                true => {
-                    lowered.clear();
-                    lowered.extend(stem_characters.iter().flat_map(|c| c.to_lowercase()));
-                    &lowered
-                }
-                false => &stem_characters,
-            };
-            let score = ngram(
-                STEM_RUN_LONGEST,
-                word,
-                compared,
-                Lengths::LongerWorse,
-                false,
-            ) + left_common(word, &stem_characters);
-            keep_if_better(&mut best_stems, &mut lowest, score, (stem, flags));
-        }
-
-        //a guess must beat the word scored against three copies of itself with every fourth
-        //letter blotted out, starting at its second, third and fourth letters
-        let mut threshold = 0;
-        for start in 1..4 {
-            let mut blotted = word.to_vec();
-            for at in (start..length).step_by(4) {
-                blotted[at] = '*';
-            }
-            threshold += ngram(length, word, &blotted, Lengths::AnyMismatch, false);
-        }
-        let threshold = threshold / 3 - 1;
-
-        //then every form the kept stems grow into that looks like the word's ends, scored on
-        //runs of every length
-        let mut guesses: Vec<(i32, Option<String>)> = (0..NGRAM_GUESSES)
-            .map(|slot| (slot_floor(slot), None))
-            .collect();
-        let mut lowest = NGRAM_GUESSES - 1;
-        for (_, stem) in &best_stems {
-            let Some((stem, flags)) = stem else {
-                continue;
-            };
-            for form in self.grow(stem, flags, word) {
-                let form_characters: Vec<char> = form.chars().collect();
-                let lowered: Vec<char> = form.to_lowercase().chars().collect();
-                let score = ngram(length, word, &lowered, Lengths::AnyMismatch, false)
-                    + left_common(word, &form_characters);
-                if score > threshold {
-                    keep_if_better(&mut guesses, &mut lowest, score, form);
-                }
-            }
-        }
-        let mut guesses: Vec<(i32, String)> = guesses
-            .into_iter()
-            .filter_map(|(score, guess)| guess.map(|guess| (score, guess)))
-            .collect();
-        guesses.sort_by_key(|(score, _)| Reverse(*score));
-
-        //rank them again on how much of the word they keep in order, its start, its letters in
-        //place, a far swap, runs of up to four and weighted pairs both ways; a guess that is the
-        //word in other capitals ends the ranking there, as Hunspell's does
-        let lowered_word: Vec<char> = word
-            .iter()
-            .collect::<String>()
-            .to_lowercase()
-            .chars()
-            .collect();
-        for (score, guess) in guesses.iter_mut() {
-            let guess_lower: Vec<char> = guess.to_lowercase().chars().collect();
-            let guess_length = guess_lower.len();
-            let common = longest_common_subsequence(word, &guess_lower);
-            if length == guess_length && length == common {
-                *score += SAME_LETTERS_BONUS;
-                break;
-            }
-            let pairs = ngram(
-                PAIR_RUN_LONGEST,
-                word,
-                &guess_lower,
-                Lengths::AnyMismatch,
-                true,
-            ) + ngram(
-                PAIR_RUN_LONGEST,
-                &guess_lower,
-                &lowered_word,
-                Lengths::AnyMismatch,
-                true,
-            );
-            let (in_place, swapped) = letters_in_place(word, &guess_lower);
-            let too_few_pairs = (pairs as f64) < (length + guess_length) as f64 * self.pair_scale;
-            *score = 2 * common as i32 - length.abs_diff(guess_length) as i32
-                + left_common(word, &guess_lower)
-                + i32::from(in_place > 0)
-                + if swapped { DISTANT_SWAP_BONUS } else { 0 }
-                + ngram(
-                    RANK_RUN_LONGEST,
-                    word,
-                    &guess_lower,
-                    Lengths::AnyMismatch,
-                    false,
-                )
-                + pairs
-                - if too_few_pairs { FEW_PAIRS_PENALTY } else { 0 };
-        }
-        guesses.sort_by_key(|(score, _)| Reverse(*score));
-
-        //take the best few: only excellent ones once one is excellent, and a poor one only when
-        //nothing else came, never one holding an earlier respelling ("naively" keeps out
-        //"naivelyness")
-        let before = found.len();
-        let mut closed = false;
-        for (score, guess) in guesses {
-            if found.len() >= before + self.ngram_suggestions || found.len() >= SUGGESTION_POOL {
-                break;
-            }
-            if closed && score <= EXCELLENT_SCORE {
-                continue;
-            }
-            if score > EXCELLENT_SCORE {
-                closed = true;
-            } else if score < POOR_SCORE {
-                closed = true;
-                if found.len() > before || self.only_max_diff {
+        typed: &[char],
+        confusions_at: &[(usize, usize)],
+        candidate: &[char],
+        cost: &mut Vec<u32>,
+    ) -> u32 {
+        let width = candidate.len() + 1;
+        cost.clear();
+        cost.resize((typed.len() + 1) * width, u32::MAX);
+        cost[0] = 0;
+        //each cell pushes its cost forward to the cells one slip on, so a cell is final by the
+        //time the walk reaches it
+        for at in 0..=typed.len() {
+            for other in 0..=candidate.len() {
+                let here = cost[at * width + other];
+                if here == u32::MAX {
                     continue;
                 }
-            }
-            let repeats = found.iter().any(|earlier| guess.contains(earlier.as_str()));
-            if !repeats && self.suggestible(&guess, personal) {
-                found.push(guess);
+                let mut relax = |to_at: usize, to_other: usize, step: u32| {
+                    let cell = &mut cost[to_at * width + to_other];
+                    *cell = (*cell).min(here + step);
+                };
+                //a letter typed that is not in the candidate (an extra one)
+                if at < typed.len() {
+                    relax(at + 1, other, letter_cost(typed, at, EXTRA_LETTER_COST));
+                }
+                //a letter of the candidate left out
+                if other < candidate.len() {
+                    relax(
+                        at,
+                        other + 1,
+                        letter_cost(candidate, other, MISSING_LETTER_COST),
+                    );
+                }
+                //the same letter, or a wrong one
+                if at < typed.len() && other < candidate.len() {
+                    let step = match typed[at] == candidate[other] {
+                        true => 0,
+                        false => self.wrong_letter_cost(typed[at], candidate[other]),
+                    };
+                    relax(at + 1, other + 1, step);
+                }
+                //two neighbouring letters swapped
+                if at + 1 < typed.len()
+                    && other + 1 < candidate.len()
+                    && typed[at] == candidate[other + 1]
+                    && typed[at + 1] == candidate[other]
+                {
+                    relax(at + 2, other + 2, SWAP_COST);
+                }
+                //a letter typed two or three places early or late (one place is a swap)
+                for distance in 2..SLIP_DISTANCE_MAX {
+                    if at + distance >= typed.len() || other + distance >= candidate.len() {
+                        break;
+                    }
+                    let early = typed[at] == candidate[other + distance]
+                        && typed[at + 1..=at + distance] == candidate[other..other + distance];
+                    let late = candidate[other] == typed[at + distance]
+                        && typed[at..at + distance] == candidate[other + 1..=other + distance];
+                    if early || late {
+                        relax(at + distance + 1, other + distance + 1, MOVE_COST);
+                    }
+                }
+                //a common misspelling the .aff lists, such as "f" typed for "ph"
+                for &(_, rule) in confusions_at.iter().filter(|(start, _)| *start == at) {
+                    let (wrong, right) = &self.confusions[rule];
+                    if candidate[other..].starts_with(right) {
+                        //the whole word listed as a misspelling is the language's own answer
+                        let whole = at == 0 && wrong.len() == typed.len();
+                        let step = if whole { 0 } else { CONFUSION_COST };
+                        relax(at + wrong.len(), other + right.len(), step);
+                    }
+                }
             }
         }
+        let first_wrong = typed.first() != candidate.first();
+        cost[typed.len() * width + candidate.len()]
+            + if first_wrong { FIRST_LETTER_COST } else { 0 }
     }
 
-    //the forms a stem grows into that could be the word: the stem itself, then each suffix its
-    //flags allow whose ending the word has, a prefix on those that combine, and each prefix
-    //alone whose beginning the word has; at most `NGRAM_FORMS_PER_STEM`
-    fn grow(&self, stem: &str, flags: &[char], word: &[char]) -> Vec<String> {
-        let word: String = word.iter().collect();
-        let word_length = word.len();
-        //an affix is only worth growing when the word carries what it adds
-        let ends_like = |affix: &Affix| {
-            affix.add.is_empty()
-                || (word_length > affix.add.len() && word.ends_with(affix.add.as_str()))
-        };
-        let starts_like = |affix: &Affix| {
-            affix.add.is_empty()
-                || (word_length > affix.add.len() && word.starts_with(affix.add.as_str()))
-        };
-        //Hunspell walks one flag's affixes last-listed first
-        let with_flag = |affixes: &'_ [Affix], flag: char| -> Vec<usize> {
-            (0..affixes.len())
-                .rev()
-                .filter(|&at| affixes[at].flag == flag)
-                .collect()
-        };
-
-        let mut forms: Vec<(String, bool)> = Vec::new();
-        if !self
-            .only_in_compound
-            .is_some_and(|flag| flags.contains(&flag))
-        {
-            forms.push((stem.to_string(), false));
-        }
-        for &flag in flags {
-            for at in with_flag(&self.suffixes, flag) {
-                let suffix = &self.suffixes[at];
-                if let Some(form) = ends_like(suffix)
-                    .then(|| suffix.apply_suffix(stem))
-                    .flatten()
-                {
-                    forms.push((form, suffix.cross_product));
-                }
-            }
-        }
-        //a prefix on each suffixed form that combines (Hunspell starts after the first form)
-        let suffixed = forms.len();
-        for index in 1..suffixed {
-            if !forms[index].1 {
-                continue;
-            }
-            for &flag in flags {
-                for at in with_flag(&self.prefixes, flag) {
-                    let prefix = &self.prefixes[at];
-                    if !prefix.cross_product || !starts_like(prefix) {
-                        continue;
-                    }
-                    if let Some(form) = prefix.apply_prefix(&forms[index].0) {
-                        forms.push((form, true));
-                    }
-                }
-            }
-        }
-        for &flag in flags {
-            for at in with_flag(&self.prefixes, flag) {
-                let prefix = &self.prefixes[at];
-                if let Some(form) = starts_like(prefix)
-                    .then(|| prefix.apply_prefix(stem))
-                    .flatten()
-                {
-                    forms.push((form, prefix.cross_product));
-                }
-            }
-        }
-        forms
-            .into_iter()
-            .take(NGRAM_FORMS_PER_STEM)
-            .map(|(form, _)| form)
+    //the listed misspellings found in a typed word, as (where it starts, which rule), worked out
+    //once per word rather than for every candidate
+    fn confusions_in(&self, typed: &[char]) -> Vec<(usize, usize)> {
+        (0..typed.len())
+            .flat_map(|at| {
+                self.confusions
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, (wrong, _))| typed[at..].starts_with(wrong))
+                    .map(move |(rule, _)| (at, rule))
+            })
             .collect()
     }
 
-    //add a respelling to `found` when it is a word that may be suggested, not there already, and
-    //the pool has room
-    fn offer(&self, candidate: &str, personal: &HashSet<String>, found: &mut Vec<String>) {
-        if found.len() < SUGGESTION_POOL
-            && !found.iter().any(|earlier| earlier == candidate)
-            && self.suggestible(candidate, personal)
+    //what one letter typed in place of another costs: less for a key beside it or a vowel for a
+    //vowel
+    fn wrong_letter_cost(&self, typed: char, meant: char) -> u32 {
+        //a space or hyphen is only ever a split, priced as one
+        if [typed, meant]
+            .iter()
+            .any(|&letter| letter == ' ' || letter == '-')
         {
-            found.push(candidate.to_string());
+            return SPLIT_COST;
         }
-    }
-
-    fn offer_characters(
-        &self,
-        candidate: &[char],
-        personal: &HashSet<String>,
-        found: &mut Vec<String>,
-    ) {
-        self.offer(&candidate.iter().collect::<String>(), personal, found);
-    }
-
-    //whether a respelling may be suggested exactly as written: the person's word, or a stem or
-    //affixed form not marked never-to-suggest, or an ordinal; unlike checking, no other capitals
-    //count, as Hunspell's suggester looks each candidate up as it is
-    fn suggestible(&self, candidate: &str, personal: &HashSet<String>) -> bool {
-        if candidate.is_empty() {
-            return false;
+        if VOWELS.contains(typed) && VOWELS.contains(meant) {
+            return VOWEL_COST;
         }
-        if candidate
-            .chars()
-            .any(|character| character.is_ascii_digit())
-        {
-            return self.compound(candidate);
+        let beside = self.keyboard.windows(2).any(|pair| {
+            (pair[0] == typed && pair[1] == meant) || (pair[0] == meant && pair[1] == typed)
+        });
+        match beside {
+            true => NEIGHBOUR_KEY_COST,
+            false => WRONG_LETTER_COST,
         }
-        personal.contains(candidate) || self.lookup(candidate, false)
     }
 
     //a word with its input conversions applied, such as ’ read as '
@@ -868,85 +782,6 @@ impl Dictionary {
             converted = converted.replace(from.as_str(), to);
         }
         converted
-    }
-
-    //check a converted word; `nosuggest` says whether stems marked never-to-suggest count, which
-    //they do when judging the text and do not when choosing what to suggest
-    fn check_converted(&self, word: &str, personal: &HashSet<String>, nosuggest: bool) -> bool {
-        if word.is_empty() {
-            return false;
-        }
-        //a hyphenated word is right when each of its parts is
-        if word.contains('-') {
-            return word
-                .split('-')
-                .filter(|part| !part.is_empty())
-                .all(|part| self.check_converted(part, personal, nosuggest));
-        }
-        //a word holding a digit is judged only when it is shaped like an ordinal
-        if word.chars().any(|character| character.is_ascii_digit()) {
-            let digits = word.trim_end_matches(|character: char| character.is_alphabetic());
-            let ordinal = digits.len() < word.len()
-                && digits.chars().all(|character| character.is_ascii_digit());
-            return !ordinal || self.compound(&word.to_lowercase());
-        }
-        //the forms a word may be found under, by its capitals
-        let lower = word.to_lowercase();
-        let forms: Vec<String> = match casing(word) {
-            Casing::Lower | Casing::Mixed => vec![word.to_string()],
-            Casing::Capitalised => vec![word.to_string(), lower],
-            Casing::AllCaps => vec![word.to_string(), recase(&lower, Casing::Capitalised), lower],
-        };
-        forms
-            .iter()
-            .any(|form| personal.contains(form) || self.lookup(form, nosuggest))
-    }
-
-    //whether one exact form is a stem, or a stem with a suffix, a prefix or both
-    fn lookup(&self, word: &str, nosuggest: bool) -> bool {
-        //a stem with no affix
-        if self.has_stem(word, &[], nosuggest) {
-            return true;
-        }
-        for suffix in &self.suffixes {
-            let Some(stem) = suffix.unapply_suffix(word) else {
-                continue;
-            };
-            if self.has_stem(&stem, &[suffix.flag], nosuggest) {
-                return true;
-            }
-            //a prefix on top of the suffix, when both combine
-            if !suffix.cross_product {
-                continue;
-            }
-            for prefix in self.prefixes.iter().filter(|prefix| prefix.cross_product) {
-                if let Some(root) = prefix.unapply_prefix(&stem)
-                    && self.has_stem(&root, &[prefix.flag, suffix.flag], nosuggest)
-                {
-                    return true;
-                }
-            }
-        }
-        self.prefixes.iter().any(|prefix| {
-            prefix
-                .unapply_prefix(word)
-                .is_some_and(|stem| self.has_stem(&stem, &[prefix.flag], nosuggest))
-        })
-    }
-
-    //whether a stem is listed carrying every flag asked for, not only inside compounds, and not
-    //never-to-suggest unless those count
-    fn has_stem(&self, stem: &str, flags: &[char], nosuggest: bool) -> bool {
-        let Some(listed) = self.stems.get(stem) else {
-            return false;
-        };
-        listed.iter().map(|&at| &self.entries[at].1).any(|entry| {
-            flags.iter().all(|flag| entry.contains(flag))
-                && !self
-                    .only_in_compound
-                    .is_some_and(|flag| entry.contains(&flag))
-                && (nosuggest || !self.nosuggest.is_some_and(|flag| entry.contains(&flag)))
-        })
     }
 
     //whether a word splits into stems that one compound rule allows ("21st" is "2" then "1st")
@@ -969,11 +804,10 @@ impl Dictionary {
         }
         (self.compound_min..=characters.len()).any(|length| {
             let piece: String = characters[..length].iter().collect();
-            let listed = self.stems.get(&piece).is_some_and(|listed| {
-                listed
-                    .iter()
-                    .any(|&at| self.entries[at].1.contains(&part.flag))
-            });
+            let listed = self
+                .digit_stems
+                .get(&piece)
+                .is_some_and(|flags| flags.contains(&part.flag));
             let next = if part.repeats { rule } else { rest };
             listed && self.compound_from(&characters[length..], next, taken + 1)
         })
@@ -981,58 +815,50 @@ impl Dictionary {
 }
 
 impl Affix {
-    //the stem a word came from if this suffix made it: the added end taken off, the stripped
-    //end put back, and the condition holding at the stem's end
-    fn unapply_suffix(&self, word: &str) -> Option<String> {
-        let base = word.strip_suffix(self.add.as_str())?;
-        if base.is_empty() && self.strip.is_empty() {
-            return None;
+    //write the word this suffix makes of a stem: the stripped end taken off and the added end
+    //put on, when the stem is longer than what is stripped and its end meets the condition;
+    //output: whether it made one
+    fn apply_suffix(&self, stem: &str, out: &mut String) -> bool {
+        let Some(base) = stem.strip_suffix(self.strip.as_str()) else {
+            return false;
+        };
+        let fits = !base.is_empty() && self.end_fits(stem);
+        if fits {
+            out.push_str(base);
+            out.push_str(&self.add);
         }
-        let stem = format!("{base}{}", self.strip);
-        self.end_fits(&stem).then_some(stem)
+        fits
     }
 
-    //the stem a word came from if this prefix made it, the condition holding at its start
-    fn unapply_prefix(&self, word: &str) -> Option<String> {
-        let base = word.strip_prefix(self.add.as_str())?;
-        if base.is_empty() && self.strip.is_empty() {
-            return None;
+    //write the word this prefix makes of a stem, its condition holding at the stem's start;
+    //output: whether it made one
+    fn apply_prefix(&self, stem: &str, out: &mut String) -> bool {
+        let Some(base) = stem.strip_prefix(self.strip.as_str()) else {
+            return false;
+        };
+        let fits = !base.is_empty() && self.start_fits(stem);
+        if fits {
+            out.push_str(&self.add);
+            out.push_str(base);
         }
-        let stem = format!("{}{base}", self.strip);
-        self.start_fits(&stem).then_some(stem)
-    }
-
-    //the word this suffix makes of a stem: the stripped end taken off and the added end put on,
-    //when the stem is longer than what is stripped and its end meets the condition
-    fn apply_suffix(&self, stem: &str) -> Option<String> {
-        let base = stem.strip_suffix(self.strip.as_str())?;
-        (!base.is_empty() && self.end_fits(stem)).then(|| format!("{base}{}", self.add))
-    }
-
-    //the word this prefix makes of a stem, its condition holding at the stem's start
-    fn apply_prefix(&self, stem: &str) -> Option<String> {
-        let base = stem.strip_prefix(self.strip.as_str())?;
-        (!base.is_empty() && self.start_fits(stem)).then(|| format!("{}{base}", self.add))
+        fits
     }
 
     //whether a stem's last letters meet a suffix's condition, one class per letter
     fn end_fits(&self, stem: &str) -> bool {
-        let tail: Vec<char> = stem.chars().rev().take(self.condition.len()).collect();
-        tail.len() == self.condition.len()
-            && tail
-                .iter()
-                .zip(self.condition.iter().rev())
-                .all(|(&character, class)| class.matches(character))
+        let mut tail = stem.chars().rev();
+        self.condition
+            .iter()
+            .rev()
+            .all(|class| tail.next().is_some_and(|letter| class.matches(letter)))
     }
 
     //whether a stem's first letters meet a prefix's condition
     fn start_fits(&self, stem: &str) -> bool {
-        let head: Vec<char> = stem.chars().take(self.condition.len()).collect();
-        head.len() == self.condition.len()
-            && head
-                .iter()
-                .zip(&self.condition)
-                .all(|(&character, class)| class.matches(character))
+        let mut head = stem.chars();
+        self.condition
+            .iter()
+            .all(|class| head.next().is_some_and(|letter| class.matches(letter)))
     }
 }
 
@@ -1116,132 +942,35 @@ fn compound_rule(text: &str) -> Result<Vec<RulePart>, String> {
     Ok(parts)
 }
 
-//how many of one word's letter runs, of each length up to `longest`, turn up anywhere in another,
-//as Hunspell's n-gram suggester counts them, less the difference in length past two
-//input: the run length to stop at, the word, the word compared with, how length differences
-//  count, and whether a run that is missing costs a point (two at either end of the word)
-//output: the score; unweighted, counting stops at the first length with fewer than two runs found
-fn ngram(longest: usize, word: &[char], other: &[char], lengths: Lengths, weighted: bool) -> i32 {
-    if other.is_empty() {
-        return 0;
-    }
-    let mut score = 0;
-    for run_length in 1..=longest {
-        let mut runs_found: i32 = 0;
-        for at in 0..(word.len() + 1).saturating_sub(run_length) {
-            let run = &word[at..at + run_length];
-            if contains_run(other, run) {
-                runs_found += 1;
-            } else if weighted {
-                runs_found -= 1;
-                if at == 0 || at == word.len() - run_length {
-                    runs_found -= 1;
-                }
-            }
-        }
-        score += runs_found;
-        if runs_found < 2 && !weighted {
-            break;
-        }
-    }
-    let longer_by = other.len() as i32 - word.len() as i32;
-    let docked = match lengths {
-        Lengths::LongerWorse => longer_by - 2,
-        Lengths::AnyMismatch => longer_by.abs() - 2,
-    };
-    score - docked.max(0)
+//where a lower-case letter a-z sits in the alphabet, or None for any other character
+fn alphabet_place(letter: char) -> Option<usize> {
+    letter
+        .is_ascii_lowercase()
+        .then(|| (letter as u8 - b'a') as usize)
 }
 
-//whether a run of letters turns up anywhere in a word; plain loops, since this runs for every
-//stem in the dictionary on each suggestion
-fn contains_run(word: &[char], run: &[char]) -> bool {
-    let mut start = 0;
-    while start + run.len() <= word.len() {
-        let mut matched = 0;
-        while matched < run.len() && word[start + matched] == run[matched] {
-            matched += 1;
-        }
-        if matched == run.len() {
-            return true;
-        }
-        start += 1;
-    }
-    false
+//a form's place in the index: FNV-1a over its bytes
+fn text_hash(text: &str) -> usize {
+    text_hash_bytes(text.as_bytes())
 }
 
-//how many letters two words share from the start, the other's first letter allowed to be a
-//capital ("Paris" for "parsi"); 0 when even the first letters differ
-fn left_common(word: &[char], other: &[char]) -> i32 {
-    let (Some(&first), Some(&other_first)) = (word.first(), other.first()) else {
-        return 0;
-    };
-    let other_first_lower = other_first.to_lowercase().next().unwrap_or(other_first);
-    if first != other_first && first != other_first_lower {
-        return 0;
-    }
-    let shared = word
-        .iter()
-        .zip(other)
-        .skip(1)
-        .take_while(|(letter, other_letter)| letter == other_letter)
-        .count();
-    1 + shared as i32
+fn text_hash_bytes(bytes: &[u8]) -> usize {
+    bytes.iter().fold(FNV_OFFSET_BASIS, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+    }) as usize
 }
 
-//how many places two words have the same letter, and whether they are the same length and
-//differ in just two places holding each other's letters (a swap at a distance)
-fn letters_in_place(word: &[char], guess: &[char]) -> (usize, bool) {
-    let mut same = 0;
-    let mut differing: Vec<usize> = Vec::new();
-    for (at, (letter, guess_letter)) in word.iter().zip(guess).enumerate() {
-        if letter == guess_letter {
-            same += 1;
-        } else {
-            differing.push(at);
-        }
+//what a letter typed extra, or left out, costs: less when it doubles the letter beside it
+//("acomodate" for "accommodate"), and a space or hyphen costs a split's price
+fn letter_cost(word: &[char], at: usize, plain: u32) -> u32 {
+    let letter = word[at];
+    if letter == ' ' || letter == '-' {
+        return SPLIT_COST;
     }
-    let swapped = word.len() == guess.len()
-        && differing.len() == 2
-        && word[differing[0]] == guess[differing[1]]
-        && word[differing[1]] == guess[differing[0]];
-    (same, swapped)
-}
-
-//the length of the longest run of letters two words have in the same order, gaps allowed
-fn longest_common_subsequence(word: &[char], other: &[char]) -> usize {
-    let mut previous_row = vec![0; other.len() + 1];
-    for &letter in word {
-        let mut row = vec![0; other.len() + 1];
-        for (at, &other_letter) in other.iter().enumerate() {
-            row[at + 1] = match letter == other_letter {
-                true => previous_row[at] + 1,
-                false => row[at].max(previous_row[at + 1]),
-            };
-        }
-        previous_row = row;
-    }
-    previous_row[other.len()]
-}
-
-//where an empty slot of a best-of list starts: each lower than the one before, as Hunspell
-//seeds them, so the first real scores fill the slots from the end
-fn slot_floor(slot: usize) -> i32 {
-    -100 * slot as i32
-}
-
-//put an item in a best-of list when it beats the lowest slot, then find the new lowest; ties
-//keep the earlier item, as Hunspell's lists do
-fn keep_if_better<T>(slots: &mut [(i32, Option<T>)], lowest: &mut usize, score: i32, item: T) {
-    if score <= slots[*lowest].0 {
-        return;
-    }
-    slots[*lowest] = (score, Some(item));
-    let mut lowest_score = score;
-    for (at, (slot_score, _)) in slots.iter().enumerate() {
-        if *slot_score < lowest_score {
-            *lowest = at;
-            lowest_score = *slot_score;
-        }
+    let doubled = (at > 0 && word[at - 1] == letter) || word.get(at + 1) == Some(&letter);
+    match doubled {
+        true => DOUBLED_LETTER_COST,
+        false => plain,
     }
 }
 
@@ -1275,4 +1004,217 @@ fn recase(word: &str, casing: Casing) -> String {
         }
         Casing::Lower | Casing::Mixed => word.to_string(),
     }
+}
+
+//a sounds-like key: the word reduced to roughly how it sounds in English, so that spellings
+//that sound alike ("sumthing", "something"; "becos", "because") share a key. Written here in
+//the spirit of Metaphone (Philips 1990): silent and doubled letters dropped, letters that make
+//the same sound folded together, vowels kept only at the start
+fn sound_key(word: &[char]) -> Vec<u8> {
+    let letters: Vec<char> = word
+        .iter()
+        .copied()
+        .filter(|c| c.is_ascii_alphabetic())
+        .collect();
+    let at = |i: usize| letters.get(i).copied().unwrap_or(' ');
+    let vowel = |c: char| "aeiouy".contains(c);
+    let mut key: Vec<u8> = Vec::new();
+    let mut i = 0;
+    //silent first letters
+    if matches!(
+        (at(0), at(1)),
+        ('k', 'n') | ('g', 'n') | ('p', 'n') | ('w', 'r') | ('p', 's')
+    ) {
+        i = 1;
+    }
+    while i < letters.len() {
+        let (c, next) = (at(i), at(i + 1));
+        let mut skip = 1;
+        let sound: Option<char> = match c {
+            'a' | 'e' | 'i' | 'o' | 'u' | 'y' => (i == 0).then_some('a'),
+            'c' if next == 'h' => {
+                skip = 2;
+                Some('x')
+            }
+            'c' if next == 'k' => {
+                skip = 2;
+                Some('k')
+            }
+            'c' if matches!(next, 'e' | 'i' | 'y') => Some('s'),
+            'c' | 'q' | 'k' => Some('k'),
+            'g' if next == 'h' => {
+                skip = 2;
+                (i == 0).then_some('k')
+            }
+            'g' if matches!(next, 'e' | 'i' | 'y') => Some('j'),
+            'g' => Some('k'),
+            'd' if next == 'g' && matches!(at(i + 2), 'e' | 'i' | 'y') => {
+                skip = 2;
+                Some('j')
+            }
+            'p' if next == 'h' => {
+                skip = 2;
+                Some('f')
+            }
+            's' if next == 'h' => {
+                skip = 2;
+                Some('x')
+            }
+            's' | 't' if next == 'i' && matches!(at(i + 2), 'o' | 'a') => Some('x'),
+            't' if next == 'h' => {
+                skip = 2;
+                Some('0')
+            }
+            'x' => {
+                key.push(b'k');
+                Some('s')
+            }
+            'z' => Some('s'),
+            'w' | 'h' => {
+                (vowel(next) && !(c == 'h' && i > 0 && "cgpst".contains(at(i - 1)))).then_some(c)
+            }
+            'v' => Some('f'),
+            other => Some(other),
+        };
+        if let Some(sound) = sound
+            && key.last() != Some(&(sound as u8))
+        {
+            key.push(sound as u8);
+        }
+        i += skip;
+    }
+    key
+}
+
+//the edit distance between two words: letters put in, taken out or changed, each one
+//(Levenshtein 1966); used to compare sounds-like keys
+fn edit_distance<T: PartialEq + Copy>(a: &[T], b: &[T]) -> u32 {
+    let mut previous: Vec<u32> = (0..=b.len() as u32).collect();
+    let mut row = vec![0; b.len() + 1];
+    for (i, &x) in a.iter().enumerate() {
+        row[0] = i as u32 + 1;
+        for (j, &y) in b.iter().enumerate() {
+            row[j + 1] = (previous[j] + u32::from(x != y))
+                .min(previous[j + 1] + 1)
+                .min(row[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut row);
+    }
+    previous[b.len()]
+}
+
+//a word's 64-bit signature: bits 0-25 say which of the letters a-z it holds, bits 26-57 which
+//letter pairs (hashed into 32), and bits 58-63 its length as a thermometer code; a slip changes
+//few bits, so words a slip or two apart have signatures a few bits apart
+fn signature<T: Copy + Into<char>>(word: &[T]) -> u64 {
+    let bit = |place: u64| 1u64 << place;
+    let mut signature: u64 = 0;
+    for &letter in word {
+        if let Some(place) = alphabet_place(letter.into()) {
+            signature |= bit(place as u64);
+        }
+    }
+    for pair in word.windows(2) {
+        let hash = (pair[0].into() as u64)
+            .wrapping_mul(31)
+            .wrapping_add(pair[1].into() as u64)
+            % 32;
+        signature |= bit(26 + hash);
+    }
+    //a thermometer code of the length: one more bit for each two letters past three
+    for (place, length) in [4usize, 6, 8, 10, 12, 14].iter().enumerate() {
+        if word.len() >= *length {
+            signature |= bit(58 + place as u64);
+        }
+    }
+    signature
+}
+
+//what finds suggestions: the forms that may be suggested, by number, and their signatures; the
+//sounds-like keys of those forms end to end and where each starts, the forms under each key
+//(positions in `suggestible`), and the keys' signatures
+#[derive(Default)]
+struct Suggester {
+    suggestible: Vec<u32>,
+    spellings: Signatures,
+    key_text: String,
+    key_starts: Vec<u32>,
+    key_form_starts: Vec<u32>,
+    key_forms: Vec<u32>,
+    sounds: Signatures,
+}
+
+impl Suggester {
+    //one sounds-like key, by its number, as bytes (keys are ASCII)
+    fn key(&self, at: usize) -> &[u8] {
+        &self.key_text.as_bytes()[self.key_starts[at] as usize..self.key_starts[at + 1] as usize]
+    }
+}
+
+//the 64-bit signatures of a list of words. Finding the near ones is a scan of them all, an XOR
+//and a bit count each: about 0.1 ms for English's 124,000. Multi-index hashing (Norouzi, Punjani
+//& Fleet 2012; four tables of 16-bit chunks, probed within 2 bits) was measured against the scan
+//on the same corpora: the same suggestions, no faster (2.8 ms against 2.6 ms a suggestion), and
+//3.5 MiB more memory, so the scan stayed
+#[derive(Default)]
+struct Signatures(Vec<u64>);
+
+impl Signatures {
+    //the positions of the words whose signatures are within `farthest` bits of the query's,
+    //nearest first (equal ones in order), at most `most` of them
+    fn near(&self, query: u64, farthest: u32, most: usize) -> Vec<u32> {
+        let mut near: Vec<(u32, u32)> = Vec::new();
+        for (position, &signature) in self.0.iter().enumerate() {
+            let distance = (signature ^ query).count_ones();
+            if distance <= farthest {
+                near.push((distance, position as u32));
+            }
+        }
+        near.sort_unstable();
+        near.truncate(most);
+        near.into_iter().map(|(_, position)| position).collect()
+    }
+}
+
+//what a candidate costs besides its slips: a name offered for a word typed in lower case, or an
+//apostrophe the word did not have ("potato's" for "potatos"), costs a little, so that at equal
+//slips the plain word comes first
+fn ranking_extra(typed: &[char], candidate: &str) -> u32 {
+    let typed_lower = typed.iter().all(|letter| !letter.is_uppercase());
+    let name = typed_lower && candidate.chars().any(char::is_uppercase);
+    let apostrophe = candidate.contains('\'') && !typed.contains(&'\'');
+    u32::from(name) * NAME_COST + u32::from(apostrophe) * APOSTROPHE_COST
+}
+
+//one prefix or suffix entry: the flag a stem carries to take it, whether it combines with an
+//affix of the other side, what it takes off the stem, what it puts on, and what the stem's end
+//(or start, for a prefix) must look like
+struct Affix {
+    flag: char,
+    cross_product: bool,
+    strip: String,
+    add: String,
+    condition: Vec<CharClass>,
+}
+
+//one character position of an affix condition: `.`, `[abc]`, `[^abc]` or a plain character
+enum CharClass {
+    Any,
+    OneOf(Vec<char>),
+    NoneOf(Vec<char>),
+}
+
+//one piece of a compound rule: a flag, and whether it may repeat any number of times (`*`)
+struct RulePart {
+    flag: char,
+    repeats: bool,
+}
+
+//how a word is capitalised, which decides the forms it may be found under
+#[derive(Clone, Copy, PartialEq)]
+enum Casing {
+    Lower,
+    Capitalised,
+    AllCaps,
+    Mixed,
 }

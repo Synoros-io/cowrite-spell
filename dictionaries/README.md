@@ -22,7 +22,8 @@ The two `.aff` files are identical; the `.dic` files differ in spelling (colour,
 
 A new folder named for the language (`de_DE`) with its `index.aff`, `index.dic` and `license`
 is all it takes, provided its `.aff` uses only what the checker implements: UTF-8, single-character
-flags, `TRY`, `ICONV`, `REP`, `NOSUGGEST`, `PFX`/`SFX` without continuation flags, and
-`COMPOUNDRULE` with `*` only (the header of `src/lib.rs` lists them). The checker refuses an `.aff`
-that asks for more and names the rule it stopped at, rather than checking wrongly. Add a row above
-with its source and integrity. Delete a folder to ship without that language.
+flags, `ICONV`, `REP`, `KEY`, `NOSUGGEST`, `NOSPLITSUGS`, `PFX`/`SFX` without continuation flags,
+and `COMPOUNDRULE` with `*` only (the header of `src/lib.rs` lists them). The checker refuses an
+`.aff` that asks for more and names the rule it stopped at, rather than checking wrongly. Add a row
+above with its source and integrity. Delete a folder to ship without that language. Suggestions
+for another language would also want its own sounds-like key: the one in `src/lib.rs` is English.
